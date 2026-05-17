@@ -5,8 +5,36 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { getDb } from "./database";
+import { reverseGeocode } from "./geocode";
 
 const router = Router();
+const MAX_ZONES = 20;
+const MIN_RADIUS_M = 10;
+const MAX_RADIUS_M = 2000;
+const EVENT_DEDUP_WINDOW_MS = 30_000;
+
+function validateZoneFields(body: Record<string, unknown>, requireAll: boolean): string | null {
+  const { name, lat, lon, radius, emoji } = body;
+  if (requireAll || name !== undefined) {
+    if (typeof name !== "string" || name.trim().length === 0) return "Field 'name' must be a non-empty string";
+    if (name.length > 60) return "Field 'name' must be at most 60 characters";
+  }
+  if (requireAll || lat !== undefined) {
+    if (typeof lat !== "number" || lat < -90 || lat > 90) return "Field 'lat' must be a number between -90 and 90";
+  }
+  if (requireAll || lon !== undefined) {
+    if (typeof lon !== "number" || lon < -180 || lon > 180) return "Field 'lon' must be a number between -180 and 180";
+  }
+  if (requireAll || radius !== undefined) {
+    if (typeof radius !== "number" || radius < MIN_RADIUS_M || radius > MAX_RADIUS_M) {
+      return `Field 'radius' must be a number between ${MIN_RADIUS_M} and ${MAX_RADIUS_M} (metres)`;
+    }
+  }
+  if (emoji !== undefined && emoji !== null && (typeof emoji !== "string" || emoji.length > 8)) {
+    return "Field 'emoji' must be a short string";
+  }
+  return null;
+}
 let pushDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Load push token on startup
@@ -439,6 +467,263 @@ router.post("/pushes/read-all", (_req: Request, res: Response) => {
   const now = new Date().toISOString();
   const result = db.prepare("UPDATE pushes SET read = 1, read_at = ? WHERE read = 0").run(now);
   res.json({ updated: result.changes });
+});
+
+// ============================================================================
+// Location: zones CRUD
+// ============================================================================
+
+// GET /location/zones
+router.get("/location/zones", (_req: Request, res: Response) => {
+  const db = getDb();
+  const rows = db.prepare("SELECT * FROM zones ORDER BY created_at ASC").all();
+  res.json(rows);
+});
+
+// POST /location/zones
+router.post("/location/zones", (req: Request, res: Response) => {
+  const err = validateZoneFields(req.body ?? {}, true);
+  if (err) {
+    res.status(400).json({ error: err });
+    return;
+  }
+  const db = getDb();
+  const count = (db.prepare("SELECT COUNT(*) as c FROM zones").get() as { c: number }).c;
+  if (count >= MAX_ZONES) {
+    res.status(400).json({ error: `Zone limit reached (${MAX_ZONES})` });
+    return;
+  }
+  const id = crypto.randomUUID();
+  const { name, emoji, lat, lon, radius } = req.body;
+  db.prepare(`
+    INSERT INTO zones (id, name, emoji, lat, lon, radius)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(id, name.trim(), emoji ?? null, lat, lon, radius);
+  const created = db.prepare("SELECT * FROM zones WHERE id = ?").get(id);
+  res.status(201).json(created);
+});
+
+// PUT /location/zones/:id
+router.put("/location/zones/:id", (req: Request, res: Response) => {
+  const err = validateZoneFields(req.body ?? {}, false);
+  if (err) {
+    res.status(400).json({ error: err });
+    return;
+  }
+  const db = getDb();
+  const existing = db.prepare("SELECT * FROM zones WHERE id = ?").get(req.params.id) as Record<string, unknown> | undefined;
+  if (!existing) {
+    res.status(404).json({ error: "Zone not found" });
+    return;
+  }
+  const { name, emoji, lat, lon, radius } = req.body;
+  db.prepare(`
+    UPDATE zones SET
+      name = COALESCE(?, name),
+      emoji = COALESCE(?, emoji),
+      lat = COALESCE(?, lat),
+      lon = COALESCE(?, lon),
+      radius = COALESCE(?, radius),
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).run(
+    name?.trim() ?? null,
+    emoji ?? null,
+    lat ?? null,
+    lon ?? null,
+    radius ?? null,
+    req.params.id
+  );
+  const updated = db.prepare("SELECT * FROM zones WHERE id = ?").get(req.params.id);
+  res.json(updated);
+});
+
+// DELETE /location/zones/:id
+router.delete("/location/zones/:id", (req: Request, res: Response) => {
+  const db = getDb();
+  const result = db.prepare("DELETE FROM zones WHERE id = ?").run(req.params.id);
+  if (result.changes === 0) {
+    res.status(404).json({ error: "Zone not found" });
+    return;
+  }
+  res.json({ ok: true });
+});
+
+// ============================================================================
+// Location: ingest
+// ============================================================================
+
+// POST /location/event — geofence enter/exit
+router.post("/location/event", (req: Request, res: Response) => {
+  const { type, zoneId, timestamp } = req.body ?? {};
+  if (type !== "enter" && type !== "exit") {
+    res.status(400).json({ error: "Field 'type' must be 'enter' or 'exit'" });
+    return;
+  }
+  if (typeof zoneId !== "string" || zoneId.length === 0) {
+    res.status(400).json({ error: "Field 'zoneId' is required" });
+    return;
+  }
+  const ts = typeof timestamp === "string" ? timestamp : new Date().toISOString();
+  const tsMs = new Date(ts).getTime();
+  if (Number.isNaN(tsMs)) {
+    res.status(400).json({ error: "Field 'timestamp' must be an ISO date string" });
+    return;
+  }
+
+  const db = getDb();
+  const zone = db.prepare("SELECT name FROM zones WHERE id = ?").get(zoneId) as { name: string } | undefined;
+
+  // Dedup: same (zone, type) within ±30s collapses to one row.
+  const recent = db.prepare(`
+    SELECT timestamp FROM location_events
+    WHERE zone_id = ? AND type = ?
+    ORDER BY timestamp DESC LIMIT 1
+  `).get(zoneId, type) as { timestamp: string } | undefined;
+  if (recent && Math.abs(tsMs - new Date(recent.timestamp).getTime()) < EVENT_DEDUP_WINDOW_MS) {
+    res.json({ ok: true, deduped: true });
+    return;
+  }
+
+  const id = crypto.randomUUID();
+  db.prepare(`
+    INSERT INTO location_events (id, type, zone_id, zone_name, timestamp)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(id, type, zoneId, zone?.name ?? null, ts);
+  console.log(`[location] event ${type} zone=${zone?.name ?? zoneId} at ${ts}`);
+  res.status(201).json({ ok: true, id });
+});
+
+// POST /location/update — significant location change ping
+router.post("/location/update", async (req: Request, res: Response) => {
+  const { lat, lon, accuracy, timestamp } = req.body ?? {};
+  if (typeof lat !== "number" || lat < -90 || lat > 90) {
+    res.status(400).json({ error: "Field 'lat' must be a number between -90 and 90" });
+    return;
+  }
+  if (typeof lon !== "number" || lon < -180 || lon > 180) {
+    res.status(400).json({ error: "Field 'lon' must be a number between -180 and 180" });
+    return;
+  }
+  const ts = typeof timestamp === "string" ? timestamp : new Date().toISOString();
+  const id = crypto.randomUUID();
+  const db = getDb();
+
+  let g: Awaited<ReturnType<typeof reverseGeocode>> = { neighborhood: null, city: null, state: null, country: null };
+  try {
+    g = await reverseGeocode(lat, lon);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[location] reverse geocode failed: ${msg}`);
+  }
+
+  db.prepare(`
+    INSERT INTO location_pings (id, lat, lon, accuracy, neighborhood, city, state, country, timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, lat, lon, typeof accuracy === "number" ? accuracy : null, g.neighborhood, g.city, g.state, g.country, ts);
+
+  res.status(201).json({ ok: true, id, neighborhood: g.neighborhood, city: g.city });
+});
+
+// ============================================================================
+// Location: read
+// ============================================================================
+
+// GET /location/current
+router.get("/location/current", (_req: Request, res: Response) => {
+  const db = getDb();
+
+  // Latest enter without a later exit for the same zone => currently in that zone.
+  const latestEnter = db.prepare(`
+    SELECT id, zone_id, zone_name, timestamp
+    FROM location_events
+    WHERE type = 'enter'
+    ORDER BY timestamp DESC LIMIT 1
+  `).get() as { zone_id: string; zone_name: string | null; timestamp: string } | undefined;
+
+  if (latestEnter) {
+    const laterExit = db.prepare(`
+      SELECT 1 FROM location_events
+      WHERE zone_id = ? AND type = 'exit' AND timestamp > ?
+      LIMIT 1
+    `).get(latestEnter.zone_id, latestEnter.timestamp);
+    if (!laterExit) {
+      const zone = db.prepare("SELECT name, emoji FROM zones WHERE id = ?").get(latestEnter.zone_id) as { name: string; emoji: string | null } | undefined;
+      const ping = db.prepare("SELECT timestamp FROM location_pings ORDER BY timestamp DESC LIMIT 1").get() as { timestamp: string } | undefined;
+      res.json({
+        in_zone: true,
+        zone_id: latestEnter.zone_id,
+        zone: zone?.name ?? latestEnter.zone_name,
+        emoji: zone?.emoji ?? null,
+        since: latestEnter.timestamp,
+        last_ping: ping?.timestamp ?? null,
+      });
+      return;
+    }
+  }
+
+  // Fallback: last ping's reverse geocode.
+  const ping = db.prepare(`
+    SELECT timestamp, neighborhood, city, state, country
+    FROM location_pings ORDER BY timestamp DESC LIMIT 1
+  `).get() as { timestamp: string; neighborhood: string | null; city: string | null; state: string | null; country: string | null } | undefined;
+
+  if (!ping) {
+    res.json({ in_zone: false, zone: null, since: null, last_ping: null });
+    return;
+  }
+
+  res.json({
+    in_zone: false,
+    zone: null,
+    neighborhood: ping.neighborhood,
+    city: ping.city,
+    state: ping.state,
+    country: ping.country,
+    last_ping: ping.timestamp,
+  });
+});
+
+// GET /location/history?from=&to=
+router.get("/location/history", (req: Request, res: Response) => {
+  const from = typeof req.query.from === "string" ? req.query.from : null;
+  const to = typeof req.query.to === "string" ? req.query.to : null;
+  const db = getDb();
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+  if (from) { conditions.push("timestamp >= ?"); params.push(from); }
+  if (to) { conditions.push("timestamp <= ?"); params.push(to); }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const events = db.prepare(
+    `SELECT id, type, zone_id, zone_name, timestamp FROM location_events ${where} ORDER BY timestamp ASC`
+  ).all(...params) as { id: string; type: string; zone_id: string; zone_name: string | null; timestamp: string }[];
+
+  // Pair enter→exit per zone.
+  const openByZone = new Map<string, { name: string | null; from: string }>();
+  const intervals: { zone_id: string; zone_name: string | null; from: string; to: string | null; duration_ms: number | null }[] = [];
+
+  for (const ev of events) {
+    if (ev.type === "enter") {
+      openByZone.set(ev.zone_id, { name: ev.zone_name, from: ev.timestamp });
+    } else if (ev.type === "exit") {
+      const open = openByZone.get(ev.zone_id);
+      if (open) {
+        intervals.push({
+          zone_id: ev.zone_id,
+          zone_name: open.name ?? ev.zone_name,
+          from: open.from,
+          to: ev.timestamp,
+          duration_ms: new Date(ev.timestamp).getTime() - new Date(open.from).getTime(),
+        });
+        openByZone.delete(ev.zone_id);
+      }
+    }
+  }
+  for (const [zone_id, open] of openByZone) {
+    intervals.push({ zone_id, zone_name: open.name, from: open.from, to: null, duration_ms: null });
+  }
+
+  res.json({ intervals });
 });
 
 export default router;

@@ -60,6 +60,56 @@ function migrate(db: Database.Database) {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       read_at DATETIME
     );
+
+    CREATE TABLE IF NOT EXISTS zones (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      emoji TEXT,
+      lat REAL NOT NULL,
+      lon REAL NOT NULL,
+      radius REAL NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS location_events (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      zone_id TEXT NOT NULL,
+      zone_name TEXT,
+      timestamp DATETIME NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_location_events_zone_time
+      ON location_events(zone_id, timestamp DESC);
+
+    CREATE TABLE IF NOT EXISTS location_pings (
+      id TEXT PRIMARY KEY,
+      lat REAL NOT NULL,
+      lon REAL NOT NULL,
+      accuracy REAL,
+      neighborhood TEXT,
+      city TEXT,
+      state TEXT,
+      country TEXT,
+      timestamp DATETIME NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_location_pings_time
+      ON location_pings(timestamp DESC);
+
+    CREATE TABLE IF NOT EXISTS reverse_geocode_cache (
+      lat_r REAL NOT NULL,
+      lon_r REAL NOT NULL,
+      neighborhood TEXT,
+      city TEXT,
+      state TEXT,
+      country TEXT,
+      fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (lat_r, lon_r)
+    );
   `);
 
   // Migration: add handled columns to existing requests table
