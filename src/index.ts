@@ -8,11 +8,14 @@ import { getDb } from "./database";
 const app = express();
 const PORT = parseInt(process.env.PORT || "3100", 10);
 
+// Trust proxy (behind reverse proxy)
+app.set("trust proxy", 1);
+
 // CORS
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
 
 // Rate limiting
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false }));
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false }));
 
 // Body parsing
 app.use(express.json());

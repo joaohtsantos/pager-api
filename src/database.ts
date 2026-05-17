@@ -39,7 +39,36 @@ function migrate(db: Database.Database) {
       priority TEXT DEFAULT 'low',
       status TEXT DEFAULT 'pending',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      resolved_at DATETIME
+      resolved_at DATETIME,
+      handled INTEGER DEFAULT 0,
+      handled_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS pushes (
+      id TEXT PRIMARY KEY,
+      category TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT,
+      source TEXT DEFAULT 'system',
+      expo_ticket_id TEXT,
+      apns_id TEXT,
+      collapse_id TEXT,
+      provider_status TEXT,
+      provider_response TEXT,
+      delivered BOOLEAN DEFAULT 0,
+      read BOOLEAN DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      read_at DATETIME
     );
   `);
+
+  // Migration: add handled columns to existing requests table
+  try { db.exec("ALTER TABLE requests ADD COLUMN handled INTEGER DEFAULT 0"); } catch {}
+  try { db.exec("ALTER TABLE requests ADD COLUMN handled_at TEXT"); } catch {}
+
+  // Migration: enrich pushes with delivery metadata
+  try { db.exec("ALTER TABLE pushes ADD COLUMN apns_id TEXT"); } catch {}
+  try { db.exec("ALTER TABLE pushes ADD COLUMN collapse_id TEXT"); } catch {}
+  try { db.exec("ALTER TABLE pushes ADD COLUMN provider_status TEXT"); } catch {}
+  try { db.exec("ALTER TABLE pushes ADD COLUMN provider_response TEXT"); } catch {}
 }
