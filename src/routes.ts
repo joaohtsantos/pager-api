@@ -55,12 +55,14 @@ export async function sendPush(opts: {
   body?: string;
   source?: string;
   collapseId?: string;
+  androidTag?: string;
 }): Promise<{ id: string; expo_ticket_id: string | null }> {
   const db = getDb();
   const id = crypto.randomUUID();
   const source = opts.source ?? "system";
   const apnsId = crypto.randomUUID();
   const collapseId = opts.collapseId ?? null;
+  const androidTag = opts.androidTag ?? null;
 
   let expoTicketId: string | null = null;
   let delivered = 0;
@@ -80,10 +82,16 @@ export async function sendPush(opts: {
           to: pushToken,
           title: opts.title,
           body: opts.body,
-          data: { category: opts.category, apnsId, collapseId },
+          // androidTag is forwarded to FCM V1 android.notification.tag so a
+          // second push with the same tag replaces the first in the system tray
+          // instead of stacking. Field name is unofficial; we set it both at
+          // top level and inside data to maximize the chance Expo's bridge
+          // honors it. If Expo strips it we fall back to direct FCM (option C).
+          data: { category: opts.category, apnsId, collapseId, ...(androidTag ? { androidTag } : {}) },
           channelId: opts.category,
           sound: "default",
           priority: opts.category === "urgent" ? "high" : "default",
+          ...(androidTag ? { _androidTag: androidTag } : {}),
         }),
       });
       const result = await resp.json() as { data?: { id?: string; status?: string }; errors?: unknown[] };
@@ -106,7 +114,7 @@ export async function sendPush(opts: {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(id, opts.category, opts.title, opts.body ?? null, source, expoTicketId, apnsId, collapseId, providerStatus, providerResponse, delivered);
 
-  console.log(`[push] id=${id} apns_id=${apnsId} collapse_id=${collapseId ?? "<none>"} delivered=${delivered} status=${providerStatus ?? "unknown"}`);
+  console.log(`[push] id=${id} apns_id=${apnsId} collapse_id=${collapseId ?? "<none>"} android_tag=${androidTag ?? "<none>"} delivered=${delivered} status=${providerStatus ?? "unknown"}`);
 
   return { id, expo_ticket_id: expoTicketId };
 }
@@ -161,10 +169,10 @@ router.post("/requests/notify", async (req: Request, res: Response) => {
     res.json({ ok: true, skipped: true, reason: "no important emails" });
     return;
   }
-  const title = count === 1 ? "📧 1 email importante" : `📧 ${count} emails importantes`;
+  const title = count === 1 ? "INBOX · 1 pendente" : `INBOX · ${count} pendentes`;
   const body = summary || "Novos emails precisam da sua atenção";
   try {
-    const result = await sendPush({ category: "alert", title, body, source: "email-agent" });
+    const result = await sendPush({ category: "alert", title, body, source: "email-agent", androidTag: "pager-email-bundle" });
     res.json({ ok: true, ...result });
   } catch (err: any) {
     console.error("Failed to send push:", err);
@@ -238,8 +246,8 @@ router.post("/requests", async (req: Request, res: Response) => {
       const pending = db.prepare("SELECT COUNT(*) as count FROM requests WHERE status = 'pending'").get() as any;
       const n = pending.count;
       if (n > 0) {
-        const title = n === 1 ? "📧 1 email importante" : `📧 ${n} emails importantes`;
-        await sendPush({ category: "alert", title, body: "Novos emails precisam da sua atenção", source: "email-agent" });
+        const title = n === 1 ? "INBOX · 1 pendente" : `INBOX · ${n} pendentes`;
+        await sendPush({ category: "alert", title, body: "Novos emails precisam da sua atenção", source: "email-agent", androidTag: "pager-email-bundle" });
         console.log(`[requests] Push sent: ${n} pending`);
       }
     } catch (err: any) {
