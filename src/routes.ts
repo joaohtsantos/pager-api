@@ -49,6 +49,35 @@ try {
 const VALID_CATEGORIES = ["urgent", "alert", "info"] as const;
 const VALID_SOURCES = ["system", "email-agent", "cron", "manual", "mcp", "sleep-cycle", "agent-monitor"] as const;
 
+// Format a multi-line body listing the subjects of pending email requests.
+// Android shows body collapsed (1-2 lines) and expanded (all lines), so the
+// notification reveals what's queued when the user expands it.
+function buildPendingBody(maxLines = 5): string {
+  try {
+    const db = getDb();
+    const rows = db.prepare(
+      "SELECT email_subject FROM requests " +
+      "WHERE status='pending' AND email_subject IS NOT NULL AND email_subject != '' " +
+      "ORDER BY created_at DESC LIMIT ?"
+    ).all(maxLines + 1) as { email_subject: string }[];
+
+    if (rows.length === 0) return "Novos emails precisam da sua atenção";
+
+    const lines = rows.slice(0, maxLines).map((r) => {
+      // 30 chars (29 + ellipsis) keeps each subject on a single line in
+      // the Android notification across phone sizes and default font scale.
+      const subj = r.email_subject.length > 30
+        ? r.email_subject.slice(0, 29) + "…"
+        : r.email_subject;
+      return `• ${subj}`;
+    });
+    if (rows.length > maxLines) lines.push("+ mais…");
+    return lines.join("\n");
+  } catch {
+    return "Novos emails precisam da sua atenção";
+  }
+}
+
 export async function sendPush(opts: {
   category: string;
   title: string;
@@ -169,8 +198,17 @@ router.post("/requests/notify", async (req: Request, res: Response) => {
     res.json({ ok: true, skipped: true, reason: "no important emails" });
     return;
   }
-  const title = count === 1 ? "INBOX · 1 pendente" : `INBOX · ${count} pendentes`;
-  const body = summary || "Novos emails precisam da sua atenção";
+  // Caller's `count` only gates whether to notify. The displayed number
+  // comes from the DB so title and body always agree.
+  const db = getDb();
+  const pending = db.prepare("SELECT COUNT(*) as n FROM requests WHERE status = 'pending'").get() as { n: number };
+  const n = pending.n;
+  if (n < 1) {
+    res.json({ ok: true, skipped: true, reason: "no pending requests in DB" });
+    return;
+  }
+  const title = n === 1 ? "Email · 1 pendente" : `Email · ${n} pendentes`;
+  const body = summary || buildPendingBody();
   try {
     const result = await sendPush({ category: "alert", title, body, source: "email-agent", androidTag: "pager-email-bundle" });
     res.json({ ok: true, ...result });
@@ -246,8 +284,8 @@ router.post("/requests", async (req: Request, res: Response) => {
       const pending = db.prepare("SELECT COUNT(*) as count FROM requests WHERE status = 'pending'").get() as any;
       const n = pending.count;
       if (n > 0) {
-        const title = n === 1 ? "INBOX · 1 pendente" : `INBOX · ${n} pendentes`;
-        await sendPush({ category: "alert", title, body: "Novos emails precisam da sua atenção", source: "email-agent", androidTag: "pager-email-bundle" });
+        const title = n === 1 ? "Email · 1 pendente" : `Email · ${n} pendentes`;
+        await sendPush({ category: "alert", title, body: buildPendingBody(), source: "email-agent", androidTag: "pager-email-bundle" });
         console.log(`[requests] Push sent: ${n} pending`);
       }
     } catch (err: any) {
