@@ -55,8 +55,8 @@ Auth header: `Authorization: Bearer $PAGER_API_KEY` on every endpoint except `/h
   blips don't get mislabeled with the surrounding neighborhood. A ping demonstrably elsewhere (a real
   trip) keeps the gap untagged. Caveat: a real trip taken with no pings at all (phone off) bounded by
   the same zone is assumed "stayed" — no data means best-guess.
-- **Transit classification:** an untagged span whose pings cover real ground (bounding box > 700 m,
-  or it bridges two different zones with too few pings to measure) is reclassified `kind:"transit"`
+- **Transit classification:** a SHORT untagged span (≤ 2 h) whose pings cover real ground (bbox > 700 m)
+  at a real pace (≥ ~1.8 km/h), or which briefly bridges two different zones, is reclassified `kind:"transit"`
   ("In transit") — no neighborhood label, no add-zone affordance. Moving pings are also excluded from
   `/location/zones/suggestions` (don't suggest a zone on a commute route). Transit isn't a place.
 - **Manual retcon (overrides):** `presence_overrides` rows relabel a time span to a zone, Unknown, or

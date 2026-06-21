@@ -493,10 +493,13 @@ export function getOverrides(db: Database.Database, fromIso?: string, toIso?: st
   }));
 }
 
-// A "transit" span: pings show real ground covered (or it sits between two
-// different zones with no clustered dwell). Transit isn't a place, so it gets no
-// neighborhood label, no "add zone" affordance, and is excluded from suggestions.
-const TRANSIT_SPREAD_M = 700;
+// A "transit" span: a SHORT span where pings show real ground covered at a real
+// pace (or it briefly bridges two different zones). Transit isn't a place, so it
+// gets no neighborhood label, no "add zone", and is excluded from suggestions.
+// Three gates keep it tight (a long or slow span is a stay, not a trip):
+const TRANSIT_SPREAD_M = 700;                 // must cover meaningful ground
+const TRANSIT_MAX_MS = 2 * 60 * 60 * 1000;    // ...within ~2h (longer = a stay)
+const TRANSIT_MIN_SPEED_MPS = 0.5;            // ...at ≥ ~1.8 km/h (slower = stationary)
 function isTransitSpan(
   db: Database.Database,
   fromIso: string,
@@ -504,6 +507,8 @@ function isTransitSpan(
   prevZoneId: string | null,
   nextZoneId: string | null
 ): boolean {
+  const durMs = new Date(toIso).getTime() - new Date(fromIso).getTime();
+  if (durMs > TRANSIT_MAX_MS) return false; // too long to be a single trip → it's a stay
   const pings = db
     .prepare("SELECT lat, lon FROM location_pings WHERE timestamp >= ? AND timestamp <= ?")
     .all(fromIso, toIso) as { lat: number; lon: number }[];
@@ -513,10 +518,12 @@ function isTransitSpan(
       minLat = Math.min(minLat, p.lat); maxLat = Math.max(maxLat, p.lat);
       minLon = Math.min(minLon, p.lon); maxLon = Math.max(maxLon, p.lon);
     }
-    // bounding-box diagonal ≈ how much ground the span covered
-    return haversineM(minLat, minLon, maxLat, maxLon) > TRANSIT_SPREAD_M;
+    const spread = haversineM(minLat, minLon, maxLat, maxLon); // ground covered
+    if (spread <= TRANSIT_SPREAD_M) return false;
+    const speedMps = durMs > 0 ? spread / (durMs / 1000) : 0;  // must imply real motion
+    return speedMps >= TRANSIT_MIN_SPEED_MPS;
   }
-  // Too few pings to measure motion: if it bridges two different zones, it's a trip.
+  // Too few pings to measure motion: a SHORT span bridging two different zones is a trip.
   return !!(prevZoneId && nextZoneId && prevZoneId !== nextZoneId);
 }
 
