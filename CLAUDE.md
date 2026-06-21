@@ -41,8 +41,12 @@ Auth header: `Authorization: Bearer $PAGER_API_KEY` on every endpoint except `/h
   (the relaunch initial-state burst) and self-heals missed transitions (an `enter` elsewhere
   closes a still-open zone). This is the authority for all reads — correct even on an un-cleaned log.
 - **Time-at-a-place** = Σ(exit − enter) per zone; untagged time is the gaps, attributed to no zone.
-- **Ping reconciliation:** a trailing open interval is closed (at the last in-zone ping) when GPS
-  pings show you've clearly left the radius — so a missed exit event doesn't overcount.
+- **GPS fusion (read-time):** geofence events miss transitions in BOTH directions (a late/absent
+  enter on arrival, a missed exit on leaving), so the ping trail is fused in as ground truth — a
+  ping inside a zone's radius opens it, a ping clearly beyond it (radius + 150 m + accuracy, on the
+  exit side only) closes it. This recovers missed enters/exits (e.g. arriving home at 23:16 when the
+  geofence enter didn't fire until 04:14). Same-zone intervals split by a <3 min gap are coalesced
+  to absorb boundary jitter. Stored events are untouched — fusion happens only on read.
 - **Ingest guard** (`POST /location/event`): single-occupancy, pure event-driven (no ping input),
   synthesizes a missed exit when you enter a new zone. Drops phantom exits / duplicate enters.
 - **Transition webhook (opt-in):** set `PAGER_TRANSITION_WEBHOOK` to fire-and-forget a POST

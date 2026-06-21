@@ -54,6 +54,8 @@ export type Ping = {
 // How far outside a zone's radius a GPS ping must sit before we believe a missed
 // exit happened (covers GPS jitter + reduced-accuracy fallback pings).
 const RECONCILE_MARGIN_M = 150;
+// Same-zone intervals split by a gap shorter than this are merged (GPS jitter).
+const COALESCE_GAP_MS = 3 * 60 * 1000;
 // A ping whose reported accuracy is this coarse is a fallback constant on iOS
 // (reduced-accuracy / significant-change), not a real measurement.
 export const ACCURACY_FALLBACK_M = 100;
@@ -93,46 +95,83 @@ export function currentZoneAt(
   return null;
 }
 
-// If a zone is still "open" but GPS pings show we've clearly left, infer the exit
-// time from the last ping that was still inside the zone. Returns the inferred
-// close timestamp, or null if we still appear to be inside (or can't tell).
-function reconcileOpenExit(db: Database.Database, zone: Zone, fromIso: string): string | null {
-  const latest = db
-    .prepare(
-      `SELECT lat, lon, accuracy, timestamp FROM location_pings
-       WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT 1`
-    )
-    .get(fromIso) as { lat: number; lon: number; accuracy: number | null; timestamp: string } | undefined;
-  if (!latest) return null; // no pings since entering → can't tell, leave open
+type StreamEvent = {
+  type: "enter" | "exit";
+  zone_id: string;
+  zone_name: string | null;
+  timestamp: string;
+  gps?: boolean; // true => derived from a GPS ping, not a geofence event
+};
 
-  const distLatest = haversineM(latest.lat, latest.lon, zone.lat, zone.lon);
-  if (distLatest <= zone.radius + RECONCILE_MARGIN_M) return null; // still inside
-
-  // We've left but no exit event fired. Find the last ping that was still inside
-  // and close the interval there (best estimate of when we actually left).
-  const insidePings = db
-    .prepare(
-      `SELECT lat, lon, timestamp FROM location_pings
-       WHERE timestamp >= ? ORDER BY timestamp ASC`
-    )
-    .all(fromIso) as { lat: number; lon: number; timestamp: string }[];
-
-  let lastInside: string | null = null;
-  for (const p of insidePings) {
-    const d = haversineM(p.lat, p.lon, zone.lat, zone.lon);
-    if (d <= zone.radius + RECONCILE_MARGIN_M) lastInside = p.timestamp;
-    else break; // first ping outside → we left around here
+// Derive zone transitions from the GPS ping trail. Geofencing misses transitions
+// in BOTH directions (a late/absent enter on arrival, a missed exit on leaving),
+// so the pings are the ground truth that corrects them. Hysteresis + accuracy
+// gating on the *exit* side prevents boundary jitter from fragmenting intervals.
+function buildGpsTransitions(
+  db: Database.Database,
+  fromIso: string | null,
+  toIso: string | null
+): StreamEvent[] {
+  const zones = getZones(db);
+  if (zones.length === 0) return [];
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+  if (fromIso) {
+    conditions.push("timestamp >= ?");
+    params.push(fromIso);
   }
-  return lastInside ?? fromIso;
+  if (toIso) {
+    conditions.push("timestamp <= ?");
+    params.push(toIso);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const pings = db
+    .prepare(`SELECT lat, lon, accuracy, timestamp FROM location_pings ${where} ORDER BY timestamp ASC`)
+    .all(...params) as { lat: number; lon: number; accuracy: number | null; timestamp: string }[];
+
+  const out: StreamEvent[] = [];
+  const nameOf = (id: string) => zones.find((z) => z.id === id)?.name ?? null;
+  let cur: string | null | undefined = undefined; // zone id | null (untagged) | undefined (unseeded)
+
+  for (const p of pings) {
+    // Non-overlapping zones ⇒ a ping is inside at most one.
+    const inZone = zones.find((z) => haversineM(p.lat, p.lon, z.lat, z.lon) <= z.radius) ?? null;
+    let next: string | null;
+    if (cur) {
+      const z = zones.find((zz) => zz.id === cur);
+      const dist = z ? haversineM(p.lat, p.lon, z.lat, z.lon) : Infinity;
+      // Coarse "fallback" pings can't be trusted to prove we left; only count
+      // accuracy toward the leave-threshold when it's a real measurement.
+      const acc = typeof p.accuracy === "number" && p.accuracy < ACCURACY_FALLBACK_M ? p.accuracy : 0;
+      if (z && dist <= z.radius) next = cur; // still inside
+      else if (inZone) next = inZone.id; // jumped straight into another zone
+      else if (z && dist > z.radius + RECONCILE_MARGIN_M + acc) next = null; // clearly left
+      else next = cur; // in the hysteresis band → hold state
+    } else {
+      next = inZone ? inZone.id : null;
+    }
+
+    if (cur === undefined) {
+      cur = next; // seed from the first ping; don't emit a transition
+      continue;
+    }
+    if (next !== cur) {
+      if (cur) out.push({ type: "exit", zone_id: cur, zone_name: nameOf(cur), timestamp: p.timestamp, gps: true });
+      if (next) out.push({ type: "enter", zone_id: next, zone_name: nameOf(next), timestamp: p.timestamp, gps: true });
+      cur = next;
+    }
+  }
+  return out;
 }
 
-// Authoritative interval list. Walks the raw event log under single-occupancy,
-// ignoring phantoms, and reconciles the trailing open interval against pings.
+// Authoritative interval list. Merges geofence events with GPS-derived
+// transitions (when useGps) and walks the result under single-occupancy:
+// phantoms collapse, and missed enters/exits are recovered from the ping trail.
 export function computeIntervals(
   db: Database.Database,
   fromIso: string | null,
   toIso: string | null,
-  reconcile = true
+  useGps = true
 ): Interval[] {
   const conditions: string[] = [];
   const params: unknown[] = [];
@@ -145,16 +184,25 @@ export function computeIntervals(
     params.push(toIso);
   }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-  const events = db
-    .prepare(
-      `SELECT id, type, zone_id, zone_name, timestamp FROM location_events ${where} ORDER BY timestamp ASC`
-    )
+  const raw = db
+    .prepare(`SELECT type, zone_id, zone_name, timestamp FROM location_events ${where} ORDER BY timestamp ASC`)
     .all(...params) as RawEvent[];
+
+  let stream: StreamEvent[] = raw.map((e) => ({
+    type: e.type as "enter" | "exit",
+    zone_id: e.zone_id,
+    zone_name: e.zone_name,
+    timestamp: e.timestamp,
+  }));
+  if (useGps) {
+    stream = stream.concat(buildGpsTransitions(db, fromIso, toIso));
+    stream.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
+  }
 
   const intervals: Interval[] = [];
   let open: { zone_id: string; name: string | null; from: string } | null = null;
 
-  const close = (toTs: string, reconciled = false) => {
+  const close = (toTs: string, reconciled: boolean) => {
     if (!open) return;
     intervals.push({
       zone_id: open.zone_id,
@@ -168,36 +216,52 @@ export function computeIntervals(
     open = null;
   };
 
-  for (const ev of events) {
+  for (const ev of stream) {
     if (ev.type === "enter") {
-      if (open && open.zone_id === ev.zone_id) continue; // duplicate enter → ignore
-      if (open) close(ev.timestamp); // entered elsewhere → missed exit, close here
+      if (open && open.zone_id === ev.zone_id) continue; // already in this zone → ignore
+      if (open) close(ev.timestamp, !!ev.gps); // entered elsewhere → close prior here
       open = { zone_id: ev.zone_id, name: ev.zone_name, from: ev.timestamp };
     } else if (ev.type === "exit") {
-      if (open && open.zone_id === ev.zone_id) close(ev.timestamp); // real exit
-      // else: phantom exit for a zone we're not in → ignore
+      if (open && open.zone_id === ev.zone_id) close(ev.timestamp, !!ev.gps);
+      // else: exit for a zone we're not in → ignore
     }
   }
 
   if (open) {
-    const zone = reconcile ? getZone(db, open.zone_id) : undefined;
-    const inferred = zone ? reconcileOpenExit(db, zone, open.from) : null;
-    if (inferred) {
-      close(inferred, true);
+    intervals.push({
+      zone_id: open.zone_id,
+      zone_name: open.name,
+      from: open.from,
+      to: null,
+      duration_ms: null,
+      open: true,
+      reconciled: false,
+    });
+  }
+
+  // Coalesce consecutive same-zone intervals separated by a sub-threshold gap —
+  // GPS jitter (a single stray ping) shouldn't split one stay into two with a
+  // fake untagged sliver between them. Real excursions (longer gaps) are kept.
+  const merged: Interval[] = [];
+  for (const iv of intervals) {
+    const prev = merged[merged.length - 1];
+    if (
+      prev &&
+      !prev.open &&
+      prev.to &&
+      prev.zone_id === iv.zone_id &&
+      new Date(iv.from).getTime() - new Date(prev.to).getTime() <= COALESCE_GAP_MS
+    ) {
+      prev.to = iv.to;
+      prev.open = iv.open;
+      prev.duration_ms = prev.to ? new Date(prev.to).getTime() - new Date(prev.from).getTime() : null;
+      prev.reconciled = prev.reconciled || iv.reconciled;
     } else {
-      intervals.push({
-        zone_id: open.zone_id,
-        zone_name: open.name,
-        from: open.from,
-        to: null,
-        duration_ms: null,
-        open: true,
-        reconciled: false,
-      });
+      merged.push({ ...iv });
     }
   }
 
-  return intervals;
+  return merged;
 }
 
 function latestPing(db: Database.Database): Ping | undefined {
