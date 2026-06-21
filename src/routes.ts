@@ -11,6 +11,7 @@ import {
   currentZoneAt,
   getCurrent,
   getStats,
+  buildTimeline,
   suggestZones,
 } from "./presence";
 
@@ -753,6 +754,14 @@ function resolveRange(req: Request): { from: string; to: string } {
 router.get("/location/stats", (req: Request, res: Response) => {
   const { from, to } = resolveRange(req);
   res.json(getStats(getDb(), from, to));
+});
+
+// GET /location/timeline?period=day|week|month  (or ?from=&to=)
+// Contiguous segments — zone stays AND the untagged gaps between them, each with
+// a duration and (for untagged) the dominant place from the ping trail.
+router.get("/location/timeline", (req: Request, res: Response) => {
+  const { from, to } = resolveRange(req);
+  res.json({ from, to, segments: buildTimeline(getDb(), from, to) });
 });
 
 // GET /location/zones/suggestions?days=14&minCount=8

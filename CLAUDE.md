@@ -31,6 +31,7 @@ Express + better-sqlite3 backend for the **Pager** system. Backend half of the p
 | GET | `/location/current` | bearer | current presence (zone or untagged) + dwell, staleness, accuracy flag |
 | GET | `/location/history?from=&to=` | bearer | clean enter→exit intervals (phantoms collapsed, open interval GPS-reconciled) |
 | GET | `/location/stats?period=day\|week\|month` | bearer | time per zone, visits, longest session, untagged time (or `?from=&to=`) |
+| GET | `/location/timeline?period=day\|week\|month` | bearer | contiguous segments: zone stays + named untagged gaps, each with duration |
 | GET | `/location/zones/suggestions?days=&minCount=` | bearer | clusters of untagged places worth tagging |
 
 Auth header: `Authorization: Bearer $PAGER_API_KEY` on every endpoint except `/health`.

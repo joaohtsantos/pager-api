@@ -421,6 +421,109 @@ export function getStats(db: Database.Database, fromIso: string, toIso: string):
   };
 }
 
+export type TimelineSegment = {
+  kind: "zone" | "untagged";
+  zone_id: string | null;
+  label: string;            // zone name, dominant place name, or "Unknown"
+  emoji: string | null;
+  from: string;
+  to: string;
+  duration_ms: number;
+  ongoing: boolean;         // segment runs up to "now"
+  neighborhood?: string | null; // for untagged segments
+  city?: string | null;
+};
+
+// Minimum untagged gap that earns its own segment — anything shorter is just a
+// transition instant between two zones, not a real "somewhere else".
+const UNTAGGED_MIN_MS = 2 * 60 * 1000;
+
+// For an untagged window, find where you most likely were from the ping trail:
+// the most frequent neighborhood/city among pings in that window.
+function dominantPlace(
+  db: Database.Database,
+  fromIso: string,
+  toIso: string
+): { neighborhood: string | null; city: string | null } {
+  const pings = db
+    .prepare(
+      `SELECT neighborhood, city FROM location_pings
+       WHERE timestamp >= ? AND timestamp <= ? AND (neighborhood IS NOT NULL OR city IS NOT NULL)`
+    )
+    .all(fromIso, toIso) as { neighborhood: string | null; city: string | null }[];
+  if (pings.length === 0) return { neighborhood: null, city: null };
+  const counts = new Map<string, { n: number; neighborhood: string | null; city: string | null }>();
+  for (const p of pings) {
+    const key = `${p.neighborhood ?? ""}|${p.city ?? ""}`;
+    const c = counts.get(key) ?? { n: 0, neighborhood: p.neighborhood, city: p.city };
+    c.n += 1;
+    counts.set(key, c);
+  }
+  let best = { n: 0, neighborhood: null as string | null, city: null as string | null };
+  for (const c of counts.values()) if (c.n > best.n) best = c;
+  return { neighborhood: best.neighborhood, city: best.city };
+}
+
+// Contiguous human-readable timeline: zone stays AND the untagged gaps between
+// them, each with a duration, so you read "home → unknown → work" top to bottom
+// without summing intervals in your head.
+export function buildTimeline(db: Database.Database, fromIso: string, toIso: string): TimelineSegment[] {
+  const now = Date.now();
+  const fromMs = new Date(fromIso).getTime();
+  const toMs = Math.min(new Date(toIso).getTime(), now);
+
+  // Clip zone intervals to the window.
+  const clipped = computeIntervals(db, null, toIso, true)
+    .map((iv) => {
+      const s = Math.max(new Date(iv.from).getTime(), fromMs);
+      const e = Math.min(iv.to ? new Date(iv.to).getTime() : now, toMs);
+      return { iv, s, e };
+    })
+    .filter((x) => x.e > x.s)
+    .sort((a, b) => a.s - b.s);
+
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const out: TimelineSegment[] = [];
+
+  const pushUntagged = (sMs: number, eMs: number) => {
+    if (eMs - sMs < UNTAGGED_MIN_MS) return;
+    const place = dominantPlace(db, iso(sMs), iso(eMs));
+    const label = place.neighborhood ?? place.city ?? "Unknown";
+    out.push({
+      kind: "untagged",
+      zone_id: null,
+      label,
+      emoji: null,
+      from: iso(sMs),
+      to: iso(eMs),
+      duration_ms: eMs - sMs,
+      ongoing: eMs >= now - 1000,
+      neighborhood: place.neighborhood,
+      city: place.city,
+    });
+  };
+
+  let cursor = clipped.length > 0 ? Math.min(fromMs, clipped[0].s) : fromMs;
+  for (const { iv, s, e } of clipped) {
+    if (s > cursor) pushUntagged(cursor, s);
+    const z = getZone(db, iv.zone_id);
+    out.push({
+      kind: "zone",
+      zone_id: iv.zone_id,
+      label: iv.zone_name ?? z?.name ?? iv.zone_id,
+      emoji: z?.emoji ?? null,
+      from: iso(s),
+      to: iso(e),
+      duration_ms: e - s,
+      ongoing: iv.open && e >= now - 1000,
+    });
+    cursor = Math.max(cursor, e);
+  }
+  if (toMs > cursor) pushUntagged(cursor, toMs);
+
+  return out;
+}
+
 export type ZoneSuggestion = {
   lat: number;
   lon: number;
