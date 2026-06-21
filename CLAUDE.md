@@ -48,6 +48,11 @@ Auth header: `Authorization: Bearer $PAGER_API_KEY` on every endpoint except `/h
   exit side only) closes it. This recovers missed enters/exits (e.g. arriving home at 23:16 when the
   geofence enter didn't fire until 04:14). Same-zone intervals split by a <3 min gap are coalesced
   to absorb boundary jitter. Stored events are untouched — fusion happens only on read.
+- **Sticky zones:** a gap between two stays in the *same* zone is absorbed when NO ping during it is
+  actually outside the zone (radius + 150 m + accuracy). So phone-idle-at-home and stray geofence
+  blips don't get mislabeled with the surrounding neighborhood. A ping demonstrably elsewhere (a real
+  trip) keeps the gap untagged. Caveat: a real trip taken with no pings at all (phone off) bounded by
+  the same zone is assumed "stayed" — no data means best-guess.
 - **Ingest guard** (`POST /location/event`): single-occupancy, pure event-driven (no ping input),
   synthesizes a missed exit when you enter a new zone. Drops phantom exits / duplicate enters.
 - **Transition webhook (opt-in):** set `PAGER_TRANSITION_WEBHOOK` to fire-and-forget a POST

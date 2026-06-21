@@ -164,6 +164,23 @@ function buildGpsTransitions(
   return out;
 }
 
+// Did the ping trail show us actually leaving the zone during (fromIso, toIso)?
+// "Left" = a ping clearly beyond the radius (with the same accuracy gating as
+// exit detection). No pings, or only pings near the zone, => we never left
+// (phone idle at home / a stray geofence blip), so the gap should be absorbed.
+function leftZoneDuringGap(db: Database.Database, zoneId: string, fromIso: string, toIso: string): boolean {
+  const z = getZone(db, zoneId);
+  if (!z) return true; // unknown zone → don't assume we stayed
+  const pings = db
+    .prepare("SELECT lat, lon, accuracy FROM location_pings WHERE timestamp > ? AND timestamp < ?")
+    .all(fromIso, toIso) as { lat: number; lon: number; accuracy: number | null }[];
+  for (const p of pings) {
+    const acc = typeof p.accuracy === "number" && p.accuracy < ACCURACY_FALLBACK_M ? p.accuracy : 0;
+    if (haversineM(p.lat, p.lon, z.lat, z.lon) > z.radius + RECONCILE_MARGIN_M + acc) return true;
+  }
+  return false;
+}
+
 // Authoritative interval list. Merges geofence events with GPS-derived
 // transitions (when useGps) and walks the result under single-occupancy:
 // phantoms collapse, and missed enters/exits are recovered from the ping trail.
@@ -245,13 +262,16 @@ export function computeIntervals(
   const merged: Interval[] = [];
   for (const iv of intervals) {
     const prev = merged[merged.length - 1];
-    if (
-      prev &&
-      !prev.open &&
-      prev.to &&
-      prev.zone_id === iv.zone_id &&
-      new Date(iv.from).getTime() - new Date(prev.to).getTime() <= COALESCE_GAP_MS
-    ) {
+    const sameZone = !!(prev && !prev.open && prev.to && prev.zone_id === iv.zone_id);
+    let mergeIt = false;
+    if (sameZone && prev && prev.to) {
+      const gapMs = new Date(iv.from).getTime() - new Date(prev.to).getTime();
+      // Short gap → GPS jitter. Longer gap with no ping outside the zone (and GPS
+      // fusion on) → we never demonstrably left, so absorb it ("sticky" zone).
+      if (gapMs <= COALESCE_GAP_MS) mergeIt = true;
+      else if (useGps && !leftZoneDuringGap(db, iv.zone_id, prev.to, iv.from)) mergeIt = true;
+    }
+    if (mergeIt && prev) {
       prev.to = iv.to;
       prev.open = iv.open;
       prev.duration_ms = prev.to ? new Date(prev.to).getTime() - new Date(prev.from).getTime() : null;
