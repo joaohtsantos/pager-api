@@ -33,6 +33,8 @@ Express + better-sqlite3 backend for the **Pager** system. Backend half of the p
 | GET | `/location/stats?period=day\|week\|month` | bearer | time per zone, visits, longest session, untagged time (or `?from=&to=`) |
 | GET | `/location/timeline?period=day\|week\|month` | bearer | contiguous segments: zone stays + named untagged gaps, each with duration |
 | GET | `/location/zones/suggestions?days=&minCount=` | bearer | clusters of untagged places worth tagging |
+| GET/POST | `/location/overrides` | bearer | list / create manual presence corrections (retcon a span to a zone or Unknown) |
+| DELETE | `/location/overrides/:id` | bearer | undo a correction |
 
 Auth header: `Authorization: Bearer $PAGER_API_KEY` on every endpoint except `/health`.
 
@@ -53,6 +55,11 @@ Auth header: `Authorization: Bearer $PAGER_API_KEY` on every endpoint except `/h
   blips don't get mislabeled with the surrounding neighborhood. A ping demonstrably elsewhere (a real
   trip) keeps the gap untagged. Caveat: a real trip taken with no pings at all (phone off) bounded by
   the same zone is assumed "stayed" — no data means best-guess.
+- **Manual retcon (overrides):** `presence_overrides` rows relabel a time span to a zone (or Unknown);
+  `buildTimeline` paints them over the computed segments (flagged `corrected`). Non-destructive —
+  events/pings are untouched, deleting the override restores the computed view. Newest override wins
+  (POST drops overlapping rows so stored ranges never overlap). For when no sensor data can recover
+  the truth and only you know where you were.
 - **Ingest guard** (`POST /location/event`): single-occupancy, pure event-driven (no ping input),
   synthesizes a missed exit when you enter a new zone. Drops phantom exits / duplicate enters.
 - **Transition webhook (opt-in):** set `PAGER_TRANSITION_WEBHOOK` to fire-and-forget a POST

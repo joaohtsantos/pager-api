@@ -12,6 +12,7 @@ import {
   getCurrent,
   getStats,
   buildTimeline,
+  getOverrides,
   suggestZones,
 } from "./presence";
 
@@ -778,6 +779,62 @@ router.get("/location/timeline", (req: Request, res: Response) => {
   }
   const { from, to } = resolveRange(req);
   res.json({ from, to, segments: buildTimeline(db, from, to) });
+});
+
+// ============================================================================
+// Location: manual presence overrides (retcon) — a non-destructive layer that
+// relabels a time span to a zone (or Unknown). Originals are never touched.
+// ============================================================================
+
+// GET /location/overrides
+router.get("/location/overrides", (_req: Request, res: Response) => {
+  res.json({ overrides: getOverrides(getDb()) });
+});
+
+// POST /location/overrides  { from, to, zone_id?: string|null, note?: string }
+// zone_id omitted/null => correct the span to Unknown. Newest wins: any existing
+// override overlapping [from,to] is replaced so stored overrides never overlap.
+router.post("/location/overrides", (req: Request, res: Response) => {
+  const { from, to, zone_id, note } = req.body ?? {};
+  const fromMs = typeof from === "string" ? new Date(from).getTime() : NaN;
+  const toMs = typeof to === "string" ? new Date(to).getTime() : NaN;
+  if (Number.isNaN(fromMs) || Number.isNaN(toMs)) {
+    res.status(400).json({ error: "Fields 'from' and 'to' must be ISO date strings" });
+    return;
+  }
+  if (toMs <= fromMs) {
+    res.status(400).json({ error: "'to' must be after 'from'" });
+    return;
+  }
+  const db = getDb();
+  if (zone_id !== undefined && zone_id !== null) {
+    if (typeof zone_id !== "string") {
+      res.status(400).json({ error: "'zone_id' must be a string or null" });
+      return;
+    }
+    const zone = db.prepare("SELECT id FROM zones WHERE id = ?").get(zone_id);
+    if (!zone) {
+      res.status(400).json({ error: "Unknown zone_id" });
+      return;
+    }
+  }
+  // Drop any overlapping overrides (newest wins → stored ranges never overlap).
+  db.prepare("DELETE FROM presence_overrides WHERE from_ts <= ? AND to_ts >= ?").run(to, from);
+  const id = crypto.randomUUID();
+  db.prepare(
+    "INSERT INTO presence_overrides (id, from_ts, to_ts, zone_id, note) VALUES (?, ?, ?, ?, ?)"
+  ).run(id, from, to, zone_id ?? null, typeof note === "string" ? note : null);
+  res.status(201).json(db.prepare("SELECT id, from_ts AS 'from', to_ts AS 'to', zone_id, note FROM presence_overrides WHERE id = ?").get(id));
+});
+
+// DELETE /location/overrides/:id — undo a correction.
+router.delete("/location/overrides/:id", (req: Request, res: Response) => {
+  const result = getDb().prepare("DELETE FROM presence_overrides WHERE id = ?").run(req.params.id);
+  if (result.changes === 0) {
+    res.status(404).json({ error: "Override not found" });
+    return;
+  }
+  res.json({ ok: true });
 });
 
 // GET /location/zones/suggestions?days=14&minCount=8

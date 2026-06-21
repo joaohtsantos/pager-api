@@ -454,7 +454,130 @@ export type TimelineSegment = {
   city?: string | null;
   lat?: number | null;      // representative coords for untagged (prefills "add zone")
   lon?: number | null;
+  corrected?: boolean;      // span manually retconned via a presence override
 };
+
+export type PresenceOverride = {
+  id: string;
+  from: string;
+  to: string;
+  zone_id: string | null;   // null => Unknown/untagged
+  note: string | null;
+};
+
+export function getOverrides(db: Database.Database, fromIso?: string, toIso?: string): PresenceOverride[] {
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+  // overlap test: override.to >= from AND override.from <= to
+  if (toIso) {
+    conditions.push("from_ts <= ?");
+    params.push(toIso);
+  }
+  if (fromIso) {
+    conditions.push("to_ts >= ?");
+    params.push(fromIso);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const rows = db
+    .prepare(`SELECT id, from_ts, to_ts, zone_id, note FROM presence_overrides ${where} ORDER BY from_ts ASC`)
+    .all(...params) as { id: string; from_ts: string; to_ts: string; zone_id: string | null; note: string | null }[];
+  return rows.map((r) => ({ id: r.id, from: r.from_ts, to: r.to_ts, zone_id: r.zone_id, note: r.note }));
+}
+
+// Paint manual overrides on top of the computed timeline within [windowFrom,windowTo].
+// Overrides win for their span: covered parts of computed segments are removed and
+// replaced by the override's zone/Unknown (flagged corrected). Non-destructive —
+// the override rows are separate; deleting one restores the computed view.
+function applyOverrides(
+  db: Database.Database,
+  segments: TimelineSegment[],
+  overrides: PresenceOverride[],
+  windowFromMs: number,
+  windowToMs: number
+): TimelineSegment[] {
+  if (overrides.length === 0) return segments;
+  const ovs = overrides
+    .map((o) => ({
+      a: Math.max(new Date(o.from).getTime(), windowFromMs),
+      b: Math.min(new Date(o.to).getTime(), windowToMs),
+      zone_id: o.zone_id,
+    }))
+    .filter((o) => o.b > o.a)
+    .sort((x, y) => x.a - y.a);
+  if (ovs.length === 0) return segments;
+
+  type Piece = TimelineSegment & { _a: number; _b: number };
+  const pieces: Piece[] = [];
+
+  // Keep the parts of each computed segment NOT covered by any override.
+  for (const seg of segments) {
+    let parts: [number, number][] = [[new Date(seg.from).getTime(), new Date(seg.to).getTime()]];
+    for (const o of ovs) {
+      const next: [number, number][] = [];
+      for (const [a, b] of parts) {
+        if (o.b <= a || o.a >= b) { next.push([a, b]); continue; }
+        if (o.a > a) next.push([a, o.a]);
+        if (o.b < b) next.push([o.b, b]);
+      }
+      parts = next;
+    }
+    for (const [a, b] of parts) if (b > a) pieces.push({ ...seg, _a: a, _b: b });
+  }
+
+  // Add the override spans themselves.
+  for (const o of ovs) {
+    if (o.zone_id) {
+      const z = getZone(db, o.zone_id);
+      pieces.push({
+        kind: "zone", zone_id: o.zone_id, label: z?.name ?? o.zone_id, emoji: z?.emoji ?? null,
+        from: "", to: "", duration_ms: 0, ongoing: false, corrected: true, _a: o.a, _b: o.b,
+      });
+    } else {
+      pieces.push({
+        kind: "untagged", zone_id: null, label: "Unknown", emoji: null,
+        from: "", to: "", duration_ms: 0, ongoing: false, corrected: true, _a: o.a, _b: o.b,
+      });
+    }
+  }
+
+  pieces.sort((x, y) => x._a - y._a);
+
+  const now = Date.now();
+  const result: TimelineSegment[] = [];
+  for (const p of pieces) {
+    if (p._b <= p._a) continue;
+    if (!p.corrected && p._b - p._a < 60_000) continue; // drop tiny boundary slivers
+    const prev = result[result.length - 1];
+    if (
+      prev &&
+      prev.kind === p.kind &&
+      prev.zone_id === p.zone_id &&
+      !!prev.corrected === !!p.corrected &&
+      Math.abs(new Date(prev.to).getTime() - p._a) < 1000
+    ) {
+      prev.to = new Date(p._b).toISOString();
+      prev.duration_ms = new Date(prev.to).getTime() - new Date(prev.from).getTime();
+      prev.ongoing = p._b >= now - 1000;
+      continue;
+    }
+    result.push({
+      kind: p.kind,
+      zone_id: p.zone_id,
+      label: p.label,
+      emoji: p.emoji,
+      from: new Date(p._a).toISOString(),
+      to: new Date(p._b).toISOString(),
+      duration_ms: p._b - p._a,
+      ongoing: p._b >= now - 1000,
+      ...(p.neighborhood !== undefined ? { neighborhood: p.neighborhood } : {}),
+      ...(p.city !== undefined ? { city: p.city } : {}),
+      ...(p.lat !== undefined ? { lat: p.lat } : {}),
+      ...(p.lon !== undefined ? { lon: p.lon } : {}),
+      ...(p.corrected ? { corrected: true } : {}),
+    });
+  }
+  return result;
+}
 
 // Minimum untagged gap that earns its own segment — anything shorter is just a
 // transition instant between two zones, not a real "somewhere else".
@@ -556,7 +679,8 @@ export function buildTimeline(db: Database.Database, fromIso: string, toIso: str
   }
   if (toMs > cursor) pushUntagged(cursor, toMs);
 
-  return out;
+  const overrides = getOverrides(db, fromIso, toIso);
+  return applyOverrides(db, out, overrides, fromMs, toMs);
 }
 
 export type ZoneSuggestion = {

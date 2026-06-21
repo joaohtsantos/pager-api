@@ -100,6 +100,18 @@ function migrate(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_location_pings_time
       ON location_pings(timestamp DESC);
 
+    CREATE TABLE IF NOT EXISTS presence_overrides (
+      id TEXT PRIMARY KEY,
+      from_ts DATETIME NOT NULL,
+      to_ts DATETIME NOT NULL,
+      zone_id TEXT,            -- NULL => corrected to Unknown/untagged
+      note TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_presence_overrides_range
+      ON presence_overrides(from_ts, to_ts);
+
     CREATE TABLE IF NOT EXISTS reverse_geocode_cache (
       lat_r REAL NOT NULL,
       lon_r REAL NOT NULL,
