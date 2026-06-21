@@ -27,7 +27,7 @@ Express + better-sqlite3 backend for the **Pager** system. Backend half of the p
 | GET/POST | `/location/zones` | bearer | list / create geofence zones |
 | PUT/DELETE | `/location/zones/:id` | bearer | edit / remove a zone |
 | POST | `/location/event` | bearer | geofence enter/exit (from the app); single-occupancy state guard drops phantoms |
-| POST | `/location/update` | bearer | significant-location-change ping (reverse-geocoded server-side); idempotent on device `timestamp` |
+| POST | `/location/update` | bearer | background location ping (reverse-geocoded server-side); idempotent on device `timestamp` |
 | GET | `/location/current` | bearer | current presence (zone or untagged) + dwell, staleness, accuracy flag |
 | GET | `/location/history?from=&to=` | bearer | clean enter→exit intervals (phantoms collapsed, open interval GPS-reconciled) |
 | GET | `/location/stats?period=day\|week\|month` | bearer | time per zone, visits, longest session, untagged time (or `?from=&to=`) |
@@ -124,10 +124,17 @@ were phantom**. All three issues are now addressed:
      the source.
    - **Cleanup** (one-time): `scripts/cleanup-events.ts` collapsed the log 360 → 129 clean rows
      (raw preserved in `location_events_raw_backup`).
-2. **Pings batched/late/out of order — MITIGATED.** iOS defers background uploads (lag p90 ≈ 16 min,
-   max 2.3 h; some out of order; duplicate device timestamps). `POST /location/update` is now
-   **idempotent on device `timestamp`**. The presence engine sorts by device `timestamp`, never
-   `created_at` — keep doing so in any new reader.
-3. **`accuracy = 100.0` is a fallback constant, not a measurement.** `presence.ts` exposes
-   `ACCURACY_FALLBACK_M = 100`; `/location/current` returns `accuracy_reliable`, and zone
-   suggestions ignore fallback pings. Still filter/flag `accuracy >= 100` before plotting raw pings.
+2. **Pings batched/late/out of order — MITIGATED.** Android batches/defers background uploads —
+   `deferredUpdatesInterval` plus **Doze mode** (screen-off + stationary heavily throttles location
+   *and* geofence callbacks until the next movement) → lag p90 ≈ 16 min, max 2.3 h; some out of order;
+   duplicate device timestamps. `POST /location/update` is now **idempotent on device `timestamp`**.
+   The presence engine sorts by device `timestamp`, never `created_at` — keep doing so in any new reader.
+3. **`accuracy = 100.0` is a fallback constant, not a measurement** (a coarse fused/network fix or a
+   default, not a real GPS lock). `presence.ts` exposes `ACCURACY_FALLBACK_M = 100`; `/location/current`
+   returns `accuracy_reliable`, and zone suggestions ignore fallback pings. Still filter/flag
+   `accuracy >= 100` before plotting raw pings.
+
+NB: device is **Android-only** (`cc.jsplayground.pager`, EAS sideload). The biggest source of
+missing data is **Doze**: a stationary arrival with the screen off may produce no geofence enter and
+no ping until you next move — no server-side trick recovers a signal that was never sent (use the
+manual override / retcon to fix those after the fact).
