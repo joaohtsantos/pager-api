@@ -6,12 +6,31 @@ import os from "os";
 import path from "path";
 import { getDb } from "./database";
 import { reverseGeocode } from "./geocode";
+import {
+  computeIntervals,
+  currentZoneAt,
+  getCurrent,
+  getStats,
+  suggestZones,
+} from "./presence";
 
 const router = Router();
 const MAX_ZONES = 20;
 const MIN_RADIUS_M = 10;
 const MAX_RADIUS_M = 2000;
-const EVENT_DEDUP_WINDOW_MS = 30_000;
+
+// Optional automation hook: on a *real* zone transition (after phantom
+// filtering) fire-and-forget a POST to this URL. Unset => no-op. Enables
+// presence automations ("arrived home → ...") without coupling them in here.
+const TRANSITION_WEBHOOK = process.env.PAGER_TRANSITION_WEBHOOK || null;
+function fireTransition(payload: { type: "enter" | "exit"; zone_id: string; zone_name: string | null; timestamp: string }): void {
+  if (!TRANSITION_WEBHOOK) return;
+  fetch(TRANSITION_WEBHOOK, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).catch((err) => console.error("[location] transition webhook failed:", err instanceof Error ? err.message : String(err)));
+}
 
 function validateZoneFields(body: Record<string, unknown>, requireAll: boolean): string | null {
   const { name, lat, lon, radius, emoji } = body;
@@ -605,24 +624,52 @@ router.post("/location/event", (req: Request, res: Response) => {
 
   const db = getDb();
   const zone = db.prepare("SELECT name FROM zones WHERE id = ?").get(zoneId) as { name: string } | undefined;
+  const zoneName = zone?.name ?? null;
 
-  // Dedup: same (zone, type) within ±30s collapses to one row.
-  const recent = db.prepare(`
-    SELECT timestamp FROM location_events
-    WHERE zone_id = ? AND type = ?
-    ORDER BY timestamp DESC LIMIT 1
-  `).get(zoneId, type) as { timestamp: string } | undefined;
-  if (recent && Math.abs(tsMs - new Date(recent.timestamp).getTime()) < EVENT_DEDUP_WINDOW_MS) {
-    res.json({ ok: true, deduped: true });
+  const insertEvent = (evType: "enter" | "exit", evZoneId: string, evZoneName: string | null, evTs: string): string => {
+    const eid = crypto.randomUUID();
+    db.prepare(
+      `INSERT INTO location_events (id, type, zone_id, zone_name, timestamp) VALUES (?, ?, ?, ?, ?)`
+    ).run(eid, evType, evZoneId, evZoneName, evTs);
+    return eid;
+  };
+
+  // Single-occupancy state guard. The Expo app re-emits the initial state of
+  // every zone on each relaunch ("enter" the one you're in + "exit" each one
+  // you're not), producing phantom events. We accept an event only when it
+  // actually changes presence, and self-heal missed transitions.
+  const current = currentZoneAt(db, ts); // open zone as of this event's timestamp
+
+  if (type === "enter") {
+    if (current && current.zone_id === zoneId) {
+      res.json({ ok: true, deduped: true, reason: "already in zone" });
+      return;
+    }
+    let synthesizedExit: string | null = null;
+    if (current) {
+      // Entered a new zone with no exit from the old one → synthesize the exit
+      // (you can only be in one zone at a time).
+      const prev = db.prepare("SELECT name FROM zones WHERE id = ?").get(current.zone_id) as { name: string } | undefined;
+      insertEvent("exit", current.zone_id, prev?.name ?? null, ts);
+      synthesizedExit = current.zone_id;
+      fireTransition({ type: "exit", zone_id: current.zone_id, zone_name: prev?.name ?? null, timestamp: ts });
+    }
+    const id = insertEvent("enter", zoneId, zoneName, ts);
+    fireTransition({ type: "enter", zone_id: zoneId, zone_name: zoneName, timestamp: ts });
+    console.log(`[location] enter zone=${zoneName ?? zoneId} at ${ts}${synthesizedExit ? ` (auto-exit ${synthesizedExit})` : ""}`);
+    res.status(201).json({ ok: true, id, ...(synthesizedExit ? { synthesized_exit: synthesizedExit } : {}) });
     return;
   }
 
-  const id = crypto.randomUUID();
-  db.prepare(`
-    INSERT INTO location_events (id, type, zone_id, zone_name, timestamp)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(id, type, zoneId, zone?.name ?? null, ts);
-  console.log(`[location] event ${type} zone=${zone?.name ?? zoneId} at ${ts}`);
+  // type === "exit"
+  if (!current || current.zone_id !== zoneId) {
+    console.log(`[location] dropped phantom exit zone=${zoneName ?? zoneId} at ${ts}`);
+    res.json({ ok: true, dropped: true, reason: "not in zone (phantom exit)" });
+    return;
+  }
+  const id = insertEvent("exit", zoneId, zoneName, ts);
+  fireTransition({ type: "exit", zone_id: zoneId, zone_name: zoneName, timestamp: ts });
+  console.log(`[location] exit zone=${zoneName ?? zoneId} at ${ts}`);
   res.status(201).json({ ok: true, id });
 });
 
@@ -640,6 +687,14 @@ router.post("/location/update", async (req: Request, res: Response) => {
   const ts = typeof timestamp === "string" ? timestamp : new Date().toISOString();
   const id = crypto.randomUUID();
   const db = getDb();
+
+  // Idempotency: iOS batches and retries background uploads, so the same device
+  // timestamp can arrive more than once. Treat it as one reading.
+  const dup = db.prepare("SELECT id FROM location_pings WHERE timestamp = ? LIMIT 1").get(ts) as { id: string } | undefined;
+  if (dup) {
+    res.json({ ok: true, deduped: true, id: dup.id });
+    return;
+  }
 
   let g: Awaited<ReturnType<typeof reverseGeocode>> = { neighborhood: null, city: null, state: null, country: null };
   try {
@@ -663,99 +718,50 @@ router.post("/location/update", async (req: Request, res: Response) => {
 
 // GET /location/current
 router.get("/location/current", (_req: Request, res: Response) => {
-  const db = getDb();
-
-  // Latest enter without a later exit for the same zone => currently in that zone.
-  const latestEnter = db.prepare(`
-    SELECT id, zone_id, zone_name, timestamp
-    FROM location_events
-    WHERE type = 'enter'
-    ORDER BY timestamp DESC LIMIT 1
-  `).get() as { zone_id: string; zone_name: string | null; timestamp: string } | undefined;
-
-  if (latestEnter) {
-    const laterExit = db.prepare(`
-      SELECT 1 FROM location_events
-      WHERE zone_id = ? AND type = 'exit' AND timestamp > ?
-      LIMIT 1
-    `).get(latestEnter.zone_id, latestEnter.timestamp);
-    if (!laterExit) {
-      const zone = db.prepare("SELECT name, emoji FROM zones WHERE id = ?").get(latestEnter.zone_id) as { name: string; emoji: string | null } | undefined;
-      const ping = db.prepare("SELECT timestamp FROM location_pings ORDER BY timestamp DESC LIMIT 1").get() as { timestamp: string } | undefined;
-      res.json({
-        in_zone: true,
-        zone_id: latestEnter.zone_id,
-        zone: zone?.name ?? latestEnter.zone_name,
-        emoji: zone?.emoji ?? null,
-        since: latestEnter.timestamp,
-        last_ping: ping?.timestamp ?? null,
-      });
-      return;
-    }
-  }
-
-  // Fallback: last ping's reverse geocode.
-  const ping = db.prepare(`
-    SELECT timestamp, neighborhood, city, state, country
-    FROM location_pings ORDER BY timestamp DESC LIMIT 1
-  `).get() as { timestamp: string; neighborhood: string | null; city: string | null; state: string | null; country: string | null } | undefined;
-
-  if (!ping) {
-    res.json({ in_zone: false, zone: null, since: null, last_ping: null });
-    return;
-  }
-
-  res.json({
-    in_zone: false,
-    zone: null,
-    neighborhood: ping.neighborhood,
-    city: ping.city,
-    state: ping.state,
-    country: ping.country,
-    last_ping: ping.timestamp,
-  });
+  res.json(getCurrent(getDb()));
 });
 
 // GET /location/history?from=&to=
+// Clean enter→exit intervals (single-occupancy; phantoms collapsed). The
+// trailing open interval is reconciled against GPS pings.
 router.get("/location/history", (req: Request, res: Response) => {
   const from = typeof req.query.from === "string" ? req.query.from : null;
   const to = typeof req.query.to === "string" ? req.query.to : null;
-  const db = getDb();
-  const conditions: string[] = [];
-  const params: unknown[] = [];
-  if (from) { conditions.push("timestamp >= ?"); params.push(from); }
-  if (to) { conditions.push("timestamp <= ?"); params.push(to); }
-  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-  const events = db.prepare(
-    `SELECT id, type, zone_id, zone_name, timestamp FROM location_events ${where} ORDER BY timestamp ASC`
-  ).all(...params) as { id: string; type: string; zone_id: string; zone_name: string | null; timestamp: string }[];
+  res.json({ intervals: computeIntervals(getDb(), from, to) });
+});
 
-  // Pair enter→exit per zone.
-  const openByZone = new Map<string, { name: string | null; from: string }>();
-  const intervals: { zone_id: string; zone_name: string | null; from: string; to: string | null; duration_ms: number | null }[] = [];
-
-  for (const ev of events) {
-    if (ev.type === "enter") {
-      openByZone.set(ev.zone_id, { name: ev.zone_name, from: ev.timestamp });
-    } else if (ev.type === "exit") {
-      const open = openByZone.get(ev.zone_id);
-      if (open) {
-        intervals.push({
-          zone_id: ev.zone_id,
-          zone_name: open.name ?? ev.zone_name,
-          from: open.from,
-          to: ev.timestamp,
-          duration_ms: new Date(ev.timestamp).getTime() - new Date(open.from).getTime(),
-        });
-        openByZone.delete(ev.zone_id);
-      }
-    }
+// Resolve a `period` shortcut (day|week|month) into [from,to] using server-local
+// boundaries, or fall back to explicit from/to query params.
+function resolveRange(req: Request): { from: string; to: string } {
+  const now = new Date();
+  const period = typeof req.query.period === "string" ? req.query.period : null;
+  if (period) {
+    const start = new Date(now);
+    start.setHours(0, 0, 0, 0);
+    if (period === "week") start.setDate(start.getDate() - 6);
+    else if (period === "month") start.setMonth(start.getMonth() - 1);
+    // "day" => since local midnight (default of `start`)
+    return { from: start.toISOString(), to: now.toISOString() };
   }
-  for (const [zone_id, open] of openByZone) {
-    intervals.push({ zone_id, zone_name: open.name, from: open.from, to: null, duration_ms: null });
-  }
+  const from = typeof req.query.from === "string" ? req.query.from : new Date(now.getTime() - 7 * 864e5).toISOString();
+  const to = typeof req.query.to === "string" ? req.query.to : now.toISOString();
+  return { from, to };
+}
 
-  res.json({ intervals });
+// GET /location/stats?period=day|week|month  (or ?from=&to=)
+// Time per zone, visit counts, longest session, and untagged time.
+router.get("/location/stats", (req: Request, res: Response) => {
+  const { from, to } = resolveRange(req);
+  res.json(getStats(getDb(), from, to));
+});
+
+// GET /location/zones/suggestions?days=14&minCount=8
+// Clusters of frequently-visited untagged places worth turning into zones.
+router.get("/location/zones/suggestions", (req: Request, res: Response) => {
+  const days = Math.min(Math.max(parseInt(req.query.days as string, 10) || 30, 1), 365);
+  const minCount = Math.max(parseInt(req.query.minCount as string, 10) || 8, 2);
+  const sinceIso = new Date(Date.now() - days * 864e5).toISOString();
+  res.json({ suggestions: suggestZones(getDb(), { sinceIso, minCount }) });
 });
 
 export default router;
