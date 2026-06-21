@@ -756,12 +756,28 @@ router.get("/location/stats", (req: Request, res: Response) => {
   res.json(getStats(getDb(), from, to));
 });
 
-// GET /location/timeline?period=day|week|month  (or ?from=&to=)
-// Contiguous segments — zone stays AND the untagged gaps between them, each with
-// a duration and (for untagged) the dominant place from the ping trail.
+// GET /location/timeline
+// Contiguous segments — zone stays AND the named untagged gaps between them.
+// Two modes:
+//   - Infinite scroll: ?limit=N[&before=<iso>]  → newest-first paging. Returns
+//     `segments` (chronological) + `next_before` cursor (pass as `before` for the
+//     older page; null when history is exhausted).
+//   - Range: ?period=day|week|month  or  ?from=&to=
 router.get("/location/timeline", (req: Request, res: Response) => {
+  const db = getDb();
+  if (req.query.limit !== undefined) {
+    const limit = Math.min(Math.max(parseInt(req.query.limit as string, 10) || 20, 1), 200);
+    const lookbackDays = Math.min(Math.max(parseInt(req.query.lookbackDays as string, 10) || 60, 1), 365);
+    const beforeIso = typeof req.query.before === "string" ? req.query.before : new Date().toISOString();
+    const fromIso = new Date(new Date(beforeIso).getTime() - lookbackDays * 864e5).toISOString();
+    const all = buildTimeline(db, fromIso, beforeIso); // chronological asc
+    const page = all.slice(Math.max(0, all.length - limit));
+    const next_before = all.length > limit && page.length > 0 ? page[0].from : null;
+    res.json({ segments: page, next_before });
+    return;
+  }
   const { from, to } = resolveRange(req);
-  res.json({ from, to, segments: buildTimeline(getDb(), from, to) });
+  res.json({ from, to, segments: buildTimeline(db, from, to) });
 });
 
 // GET /location/zones/suggestions?days=14&minCount=8

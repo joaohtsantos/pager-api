@@ -432,6 +432,8 @@ export type TimelineSegment = {
   ongoing: boolean;         // segment runs up to "now"
   neighborhood?: string | null; // for untagged segments
   city?: string | null;
+  lat?: number | null;      // representative coords for untagged (prefills "add zone")
+  lon?: number | null;
 };
 
 // Minimum untagged gap that earns its own segment — anything shorter is just a
@@ -439,29 +441,40 @@ export type TimelineSegment = {
 const UNTAGGED_MIN_MS = 2 * 60 * 1000;
 
 // For an untagged window, find where you most likely were from the ping trail:
-// the most frequent neighborhood/city among pings in that window.
+// the most frequent neighborhood/city, plus the centroid of that cluster's pings
+// (so the app can prefill an "add zone here" form).
 function dominantPlace(
   db: Database.Database,
   fromIso: string,
   toIso: string
-): { neighborhood: string | null; city: string | null } {
+): { neighborhood: string | null; city: string | null; lat: number | null; lon: number | null } {
   const pings = db
     .prepare(
-      `SELECT neighborhood, city FROM location_pings
-       WHERE timestamp >= ? AND timestamp <= ? AND (neighborhood IS NOT NULL OR city IS NOT NULL)`
+      `SELECT lat, lon, neighborhood, city FROM location_pings
+       WHERE timestamp >= ? AND timestamp <= ?`
     )
-    .all(fromIso, toIso) as { neighborhood: string | null; city: string | null }[];
-  if (pings.length === 0) return { neighborhood: null, city: null };
-  const counts = new Map<string, { n: number; neighborhood: string | null; city: string | null }>();
+    .all(fromIso, toIso) as { lat: number; lon: number; neighborhood: string | null; city: string | null }[];
+  if (pings.length === 0) return { neighborhood: null, city: null, lat: null, lon: null };
+  const counts = new Map<
+    string,
+    { n: number; neighborhood: string | null; city: string | null; sumLat: number; sumLon: number }
+  >();
   for (const p of pings) {
     const key = `${p.neighborhood ?? ""}|${p.city ?? ""}`;
-    const c = counts.get(key) ?? { n: 0, neighborhood: p.neighborhood, city: p.city };
+    const c = counts.get(key) ?? { n: 0, neighborhood: p.neighborhood, city: p.city, sumLat: 0, sumLon: 0 };
     c.n += 1;
+    c.sumLat += p.lat;
+    c.sumLon += p.lon;
     counts.set(key, c);
   }
-  let best = { n: 0, neighborhood: null as string | null, city: null as string | null };
+  let best = { n: 0, neighborhood: null as string | null, city: null as string | null, sumLat: 0, sumLon: 0 };
   for (const c of counts.values()) if (c.n > best.n) best = c;
-  return { neighborhood: best.neighborhood, city: best.city };
+  return {
+    neighborhood: best.neighborhood,
+    city: best.city,
+    lat: best.n > 0 ? Math.round((best.sumLat / best.n) * 1e6) / 1e6 : null,
+    lon: best.n > 0 ? Math.round((best.sumLon / best.n) * 1e6) / 1e6 : null,
+  };
 }
 
 // Contiguous human-readable timeline: zone stays AND the untagged gaps between
@@ -500,6 +513,8 @@ export function buildTimeline(db: Database.Database, fromIso: string, toIso: str
       ongoing: eMs >= now - 1000,
       neighborhood: place.neighborhood,
       city: place.city,
+      lat: place.lat,
+      lon: place.lon,
     });
   };
 
