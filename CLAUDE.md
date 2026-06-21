@@ -55,7 +55,12 @@ Auth header: `Authorization: Bearer $PAGER_API_KEY` on every endpoint except `/h
   blips don't get mislabeled with the surrounding neighborhood. A ping demonstrably elsewhere (a real
   trip) keeps the gap untagged. Caveat: a real trip taken with no pings at all (phone off) bounded by
   the same zone is assumed "stayed" — no data means best-guess.
-- **Manual retcon (overrides):** `presence_overrides` rows relabel a time span to a zone (or Unknown);
+- **Transit classification:** an untagged span whose pings cover real ground (bounding box > 700 m,
+  or it bridges two different zones with too few pings to measure) is reclassified `kind:"transit"`
+  ("In transit") — no neighborhood label, no add-zone affordance. Moving pings are also excluded from
+  `/location/zones/suggestions` (don't suggest a zone on a commute route). Transit isn't a place.
+- **Manual retcon (overrides):** `presence_overrides` rows relabel a time span to a zone, Unknown, or
+  transit (`kind` column);
   `buildTimeline` paints them over the computed segments (flagged `corrected`). Non-destructive —
   events/pings are untouched, deleting the override restores the computed view. Newest override wins
   (POST drops overlapping rows so stored ranges never overlap). For when no sensor data can recover

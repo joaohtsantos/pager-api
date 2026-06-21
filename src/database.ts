@@ -104,7 +104,8 @@ function migrate(db: Database.Database) {
       id TEXT PRIMARY KEY,
       from_ts DATETIME NOT NULL,
       to_ts DATETIME NOT NULL,
-      zone_id TEXT,            -- NULL => corrected to Unknown/untagged
+      kind TEXT DEFAULT 'zone', -- 'zone' | 'unknown' | 'transit'
+      zone_id TEXT,             -- set only when kind = 'zone'
       note TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -127,6 +128,9 @@ function migrate(db: Database.Database) {
   // Migration: add handled columns to existing requests table
   try { db.exec("ALTER TABLE requests ADD COLUMN handled INTEGER DEFAULT 0"); } catch {}
   try { db.exec("ALTER TABLE requests ADD COLUMN handled_at TEXT"); } catch {}
+
+  // Migration: presence_overrides gains a kind column (zone|unknown|transit)
+  try { db.exec("ALTER TABLE presence_overrides ADD COLUMN kind TEXT DEFAULT 'zone'"); } catch {}
 
   // Migration: enrich pushes with delivery metadata
   try { db.exec("ALTER TABLE pushes ADD COLUMN apns_id TEXT"); } catch {}

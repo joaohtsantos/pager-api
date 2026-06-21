@@ -442,7 +442,7 @@ export function getStats(db: Database.Database, fromIso: string, toIso: string):
 }
 
 export type TimelineSegment = {
-  kind: "zone" | "untagged";
+  kind: "zone" | "untagged" | "transit";
   zone_id: string | null;
   label: string;            // zone name, dominant place name, or "Unknown"
   emoji: string | null;
@@ -457,11 +457,13 @@ export type TimelineSegment = {
   corrected?: boolean;      // span manually retconned via a presence override
 };
 
+export type OverrideKind = "zone" | "unknown" | "transit";
 export type PresenceOverride = {
   id: string;
   from: string;
   to: string;
-  zone_id: string | null;   // null => Unknown/untagged
+  kind: OverrideKind;
+  zone_id: string | null;   // set only when kind === "zone"
   note: string | null;
 };
 
@@ -479,9 +481,43 @@ export function getOverrides(db: Database.Database, fromIso?: string, toIso?: st
   }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
   const rows = db
-    .prepare(`SELECT id, from_ts, to_ts, zone_id, note FROM presence_overrides ${where} ORDER BY from_ts ASC`)
-    .all(...params) as { id: string; from_ts: string; to_ts: string; zone_id: string | null; note: string | null }[];
-  return rows.map((r) => ({ id: r.id, from: r.from_ts, to: r.to_ts, zone_id: r.zone_id, note: r.note }));
+    .prepare(`SELECT id, from_ts, to_ts, kind, zone_id, note FROM presence_overrides ${where} ORDER BY from_ts ASC`)
+    .all(...params) as { id: string; from_ts: string; to_ts: string; kind: string | null; zone_id: string | null; note: string | null }[];
+  return rows.map((r) => ({
+    id: r.id,
+    from: r.from_ts,
+    to: r.to_ts,
+    kind: (r.kind as OverrideKind) ?? (r.zone_id ? "zone" : "unknown"),
+    zone_id: r.zone_id,
+    note: r.note,
+  }));
+}
+
+// A "transit" span: pings show real ground covered (or it sits between two
+// different zones with no clustered dwell). Transit isn't a place, so it gets no
+// neighborhood label, no "add zone" affordance, and is excluded from suggestions.
+const TRANSIT_SPREAD_M = 700;
+function isTransitSpan(
+  db: Database.Database,
+  fromIso: string,
+  toIso: string,
+  prevZoneId: string | null,
+  nextZoneId: string | null
+): boolean {
+  const pings = db
+    .prepare("SELECT lat, lon FROM location_pings WHERE timestamp >= ? AND timestamp <= ?")
+    .all(fromIso, toIso) as { lat: number; lon: number }[];
+  if (pings.length >= 2) {
+    let minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
+    for (const p of pings) {
+      minLat = Math.min(minLat, p.lat); maxLat = Math.max(maxLat, p.lat);
+      minLon = Math.min(minLon, p.lon); maxLon = Math.max(maxLon, p.lon);
+    }
+    // bounding-box diagonal ≈ how much ground the span covered
+    return haversineM(minLat, minLon, maxLat, maxLon) > TRANSIT_SPREAD_M;
+  }
+  // Too few pings to measure motion: if it bridges two different zones, it's a trip.
+  return !!(prevZoneId && nextZoneId && prevZoneId !== nextZoneId);
 }
 
 // Paint manual overrides on top of the computed timeline within [windowFrom,windowTo].
@@ -500,6 +536,7 @@ function applyOverrides(
     .map((o) => ({
       a: Math.max(new Date(o.from).getTime(), windowFromMs),
       b: Math.min(new Date(o.to).getTime(), windowToMs),
+      kind: o.kind,
       zone_id: o.zone_id,
     }))
     .filter((o) => o.b > o.a)
@@ -526,10 +563,15 @@ function applyOverrides(
 
   // Add the override spans themselves.
   for (const o of ovs) {
-    if (o.zone_id) {
+    if (o.kind === "zone" && o.zone_id) {
       const z = getZone(db, o.zone_id);
       pieces.push({
         kind: "zone", zone_id: o.zone_id, label: z?.name ?? o.zone_id, emoji: z?.emoji ?? null,
+        from: "", to: "", duration_ms: 0, ongoing: false, corrected: true, _a: o.a, _b: o.b,
+      });
+    } else if (o.kind === "transit") {
+      pieces.push({
+        kind: "transit", zone_id: null, label: "In transit", emoji: null,
         from: "", to: "", duration_ms: 0, ongoing: false, corrected: true, _a: o.a, _b: o.b,
       });
     } else {
@@ -679,6 +721,23 @@ export function buildTimeline(db: Database.Database, fromIso: string, toIso: str
   }
   if (toMs > cursor) pushUntagged(cursor, toMs);
 
+  // Reclassify untagged spans that are really transit (moving), using neighbours
+  // for context. Transit isn't a place → drop the neighborhood label/coords.
+  for (let i = 0; i < out.length; i++) {
+    const s = out[i];
+    if (s.kind !== "untagged") continue;
+    const prevZone = out[i - 1]?.kind === "zone" ? out[i - 1].zone_id : null;
+    const nextZone = out[i + 1]?.kind === "zone" ? out[i + 1].zone_id : null;
+    if (isTransitSpan(db, s.from, s.to, prevZone, nextZone)) {
+      s.kind = "transit";
+      s.label = "In transit";
+      s.neighborhood = null;
+      s.city = null;
+      s.lat = null;
+      s.lon = null;
+    }
+  }
+
   const overrides = getOverrides(db, fromIso, toIso);
   return applyOverrides(db, out, overrides, fromMs, toMs);
 }
@@ -728,7 +787,18 @@ export function suggestZones(
   };
   const clusters: Cluster[] = [];
 
+  let prev: { lat: number; lon: number; timestamp: string } | null = null;
   for (const p of pings) {
+    // Skip pings taken in motion (transit) — don't suggest a zone on a route.
+    const moving = (() => {
+      if (!prev) return false;
+      const dt = (new Date(p.timestamp).getTime() - new Date(prev.timestamp).getTime()) / 1000;
+      if (dt <= 0) return false;
+      const speed = haversineM(p.lat, p.lon, prev.lat, prev.lon) / dt; // m/s
+      return speed > 2.5; // ~9 km/h ⇒ not dwelling
+    })();
+    prev = { lat: p.lat, lon: p.lon, timestamp: p.timestamp };
+    if (moving) continue;
     if (p.accuracy != null && p.accuracy >= ACCURACY_FALLBACK_M) continue; // skip fallback pings
     if (zones.some((z) => haversineM(p.lat, p.lon, z.lat, z.lon) <= z.radius)) continue; // inside a known zone
     let placed = false;
