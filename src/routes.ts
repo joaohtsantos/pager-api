@@ -47,7 +47,9 @@ try {
 }
 
 const VALID_CATEGORIES = ["urgent", "alert", "info"] as const;
-const VALID_SOURCES = ["system", "email-agent", "cron", "manual", "mcp", "sleep-cycle", "agent-monitor"] as const;
+// `source` is intentionally free-form (no allow-list): any string is accepted and
+// stored as-is; it's only a provenance tag, never gates behaviour. Defaults to
+// "system" when absent (see sendPush).
 
 // Format a multi-line body listing the subjects of pending email requests.
 // Android shows body collapsed (1-2 lines) and expanded (all lines), so the
@@ -79,7 +81,7 @@ function buildPendingBody(maxLines = 5): string {
 }
 
 export async function sendPush(opts: {
-  category: string;
+  category?: string; // DEPRECATED & ignored — every push is forced to "urgent" below
   title: string;
   body?: string;
   source?: string;
@@ -89,6 +91,10 @@ export async function sendPush(opts: {
   const db = getDb();
   const id = crypto.randomUUID();
   const source = opts.source ?? "system";
+  // FULL-URGENT policy: every push is forced to "urgent" regardless of what the
+  // caller sent. This is the single chokepoint all pushes funnel through (POST
+  // /pushes + internal callers), so this one line covers the whole system.
+  const category = "urgent";
   const apnsId = crypto.randomUUID();
   const collapseId = opts.collapseId ?? null;
   const androidTag = opts.androidTag ?? null;
@@ -116,10 +122,10 @@ export async function sendPush(opts: {
           // instead of stacking. Field name is unofficial; we set it both at
           // top level and inside data to maximize the chance Expo's bridge
           // honors it. If Expo strips it we fall back to direct FCM (option C).
-          data: { category: opts.category, apnsId, collapseId, ...(androidTag ? { androidTag } : {}) },
-          channelId: opts.category,
+          data: { category, apnsId, collapseId, ...(androidTag ? { androidTag } : {}) },
+          channelId: category,
           sound: "default",
-          priority: opts.category === "urgent" ? "high" : "default",
+          priority: "high",
           ...(androidTag ? { _androidTag: androidTag } : {}),
         }),
       });
@@ -141,7 +147,7 @@ export async function sendPush(opts: {
   db.prepare(`
     INSERT INTO pushes (id, category, title, body, source, expo_ticket_id, apns_id, collapse_id, provider_status, provider_response, delivered)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, opts.category, opts.title, opts.body ?? null, source, expoTicketId, apnsId, collapseId, providerStatus, providerResponse, delivered);
+  `).run(id, category, opts.title, opts.body ?? null, source, expoTicketId, apnsId, collapseId, providerStatus, providerResponse, delivered);
 
   console.log(`[push] id=${id} apns_id=${apnsId} collapse_id=${collapseId ?? "<none>"} android_tag=${androidTag ?? "<none>"} delivered=${delivered} status=${providerStatus ?? "unknown"}`);
 
@@ -210,7 +216,7 @@ router.post("/requests/notify", async (req: Request, res: Response) => {
   const title = n === 1 ? "Email · 1 pendente" : `Email · ${n} pendentes`;
   const body = summary || buildPendingBody();
   try {
-    const result = await sendPush({ category: "alert", title, body, source: "email-agent", androidTag: "pager-email-bundle" });
+    const result = await sendPush({ category: "urgent", title, body, source: "email-agent", androidTag: "pager-email-bundle" });
     res.json({ ok: true, ...result });
   } catch (err: any) {
     console.error("Failed to send push:", err);
@@ -285,7 +291,7 @@ router.post("/requests", async (req: Request, res: Response) => {
       const n = pending.count;
       if (n > 0) {
         const title = n === 1 ? "Email · 1 pendente" : `Email · ${n} pendentes`;
-        await sendPush({ category: "alert", title, body: buildPendingBody(), source: "email-agent", androidTag: "pager-email-bundle" });
+        await sendPush({ category: "urgent", title, body: buildPendingBody(), source: "email-agent", androidTag: "pager-email-bundle" });
         console.log(`[requests] Push sent: ${n} pending`);
       }
     } catch (err: any) {
@@ -364,32 +370,10 @@ router.patch("/requests/:id", (req: Request, res: Response) => {
 
   const updated = db.prepare("SELECT * FROM requests WHERE id = ?").get(req.params.id) as Record<string, unknown>;
 
-  if (status === "approved") {
-    const subject = (updated.email_subject as string) || "Request";
-
-    // Append actionable TODO to Jonathan's list for the todo-resolver to pick up
-    const todoFile = path.join(os.homedir(), "obsidian-vault/jonathan/TODO-Jonathan.md");
-    const type = updated.type as string || "unknown";
-    const action = (updated.proposed_action as string) || "";
-    let line = "";
-    const shortSubject = subject.slice(0, 80);
-    if (type === "add_todo") {
-      line = `- [ ] 📧 Adicionar ao TODO-Personal.md: "${shortSubject}" (id:${updated.id})\n`;
-    } else if (type === "add_calendar") {
-      line = `- [ ] 📧 Adicionar ao calendar.md: "${shortSubject}" (id:${updated.id})\n`;
-    } else if (type === "summary") {
-      line = `- [ ] 📧 Ler e extrair insights: "${shortSubject}" (id:${updated.id})\n`;
-    }
-    if (line) {
-      try {
-        fs.appendFileSync(todoFile, line);
-        console.log(`[approve] Appended to ${todoFile}: ${type}`);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[approve] Failed to append to TODO-Jonathan: ${msg}`);
-      }
-    }
-  }
+  // Approved requests are executed by the Opus executor (jonathan-crons/executor.sh),
+  // which polls GET /requests?status=approved&handled=false and marks each handled.
+  // (Previously this appended a line to jonathan/TODO-Jonathan.md for the openclaw resolver;
+  //  removed to avoid double-execution now that the executor owns this.)
 
   res.json(updated);
 });
@@ -412,20 +396,22 @@ router.patch("/requests/:id/handled", (req: Request, res: Response) => {
 router.post("/pushes", async (req: Request, res: Response) => {
   const { category, title, body, source } = req.body;
 
-  if (!category || !VALID_CATEGORIES.includes(category)) {
-    res.status(400).json({ error: "Field 'category' must be one of: urgent, alert, info" });
-    return;
-  }
   if (!title || typeof title !== "string") {
     res.status(400).json({ error: "Field 'title' is required and must be a string" });
     return;
   }
-  if (source !== undefined && !VALID_SOURCES.includes(source)) {
-    res.status(400).json({ error: "Field 'source' must be one of: system, email-agent, cron, manual, mcp, sleep-cycle, agent-monitor" });
-    return;
-  }
 
-  const { id } = await sendPush({ category, title, body, source });
+  // DEPRECATION (phase 1): `category` is optional and IGNORED — every push is urgent.
+  // We still accept it for backward compatibility, but signal deprecation so callers
+  // migrate off it before phase 2 (reject). RFC 8594 Deprecation + a 299 Warning header.
+  if (category !== undefined) {
+    res.set("Deprecation", "true");
+    res.set("Warning", '299 - "The \'category\' field is deprecated and ignored; all pushes are urgent. It will be rejected in a future release."');
+    console.warn(`[deprecation] /pushes received category="${category}" (ignored) source="${source ?? "system"}"`);
+  }
+  // source is free-form — no validation; stored as-is (defaults to "system" if absent).
+
+  const { id } = await sendPush({ title, body, source }); // category intentionally not forwarded
 
   const db = getDb();
   const created = db.prepare("SELECT * FROM pushes WHERE id = ?").get(id);
